@@ -127,21 +127,104 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
 }
 
 TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    num_threads_ = num_threads;
+    killed_ = false;
+    next_launch_id_ = 0;
+
+    workers_.reserve(num_threads_);
+    for (int i = 0; i < num_threads_; i++) {
+        workers_.emplace_back(&TaskSystemParallelThreadPoolSleeping::workerLoop, this);
+    }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
-    //
-    // TODO: CS149 student implementations may decide to perform cleanup
-    // operations (such as thread pool shutdown construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        killed_ = true;
+    }
+    run_cv_.notify_all();
+
+    for (auto& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+void TaskSystemParallelThreadPoolSleeping::workerLoop() {
+    while (true) {
+        int sub_idx = -1;
+        int total = 0;
+        IRunnable* runnable = nullptr;
+        std::shared_ptr<TaskInfo> task_to_complete = nullptr;
+
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            run_cv_.wait(lock, [this]() {
+                return killed_ || !ready_tasks_.empty();
+            });
+
+            if (killed_ && ready_tasks_.empty()) {
+                return;
+            }
+
+            TaskID current_id = ready_tasks_.front();
+            auto it = tasks_map_.find(current_id);
+            if (it == tasks_map_.end()) {
+                ready_tasks_.pop();
+                continue;
+            }
+
+            std::shared_ptr<TaskInfo> info = it->second;
+            sub_idx = info->next_task_idx++;
+            runnable = info->runnable;
+            total = info->total_tasks;
+
+            // Immediately evict the task launch once all sub-tasks have been claimed
+            if (info->next_task_idx >= info->total_tasks) {
+                ready_tasks_.pop();
+            }
+
+            task_to_complete = info;
+        }
+
+        // Run sub-task outside the lock
+        runnable->runTask(sub_idx, total);
+
+        // Update completion status and resolve dependencies
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            task_to_complete->completed_tasks++;
+
+            if (task_to_complete->completed_tasks == task_to_complete->total_tasks) {
+                bool new_tasks_ready = false;
+
+                // Propagate completion to all dependent tasks
+                for (TaskID dep_id : task_to_complete->dependents) {
+                    auto dep_it = tasks_map_.find(dep_id);
+                    if (dep_it != tasks_map_.end()) {
+                        dep_it->second->unresolved_deps--;
+                        if (dep_it->second->unresolved_deps == 0) {
+                            if (dep_it->second->total_tasks > 0) {
+                                ready_tasks_.push(dep_id);
+                                new_tasks_ready = true;
+                            }
+                        }
+                    }
+                }
+
+                tasks_map_.erase(task_to_complete->task_id);
+
+                if (new_tasks_ready) {
+                    run_cv_.notify_all();
+                }
+
+                if (tasks_map_.empty()) {
+                    sync_cv_.notify_all();
+                }
+            }
+        }
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
