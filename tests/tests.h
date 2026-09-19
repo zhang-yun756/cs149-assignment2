@@ -57,58 +57,127 @@ typedef struct {
  *  example.
  * ==================================================================
 */
-/*
- * Implement your task here
-*/
-class YourTask : public IRunnable {
-    public:
-        YourTask() {}
-        ~YourTask() {}
-        void runTask(int task_id, int num_total_tasks) {}
+class CustomInitTask : public IRunnable {
+    int* buf_;
+    int num_elements_;
+public:
+    CustomInitTask(int* buf, int num_elements) : buf_(buf), num_elements_(num_elements) {}
+    void runTask(int task_id, int num_total_tasks) {
+        int chunk = num_elements_ / num_total_tasks;
+        int start = task_id * chunk;
+        int end = (task_id == num_total_tasks - 1) ? num_elements_ : start + chunk;
+        for (int i = start; i < end; i++) {
+            buf_[i] = i + 1;
+        }
+    }
 };
-/*
- * Implement your test here. Call this function from a wrapper that passes in
- * do_async and num_elements. See `simpleTest`, `simpleTestSync`, and
- * `simpleTestAsync` as an example.
- */
-TestResults yourTest(ITaskSystem* t, bool do_async, int num_elements, int num_bulk_task_launches) {
-    // TODO: initialize your input and output buffers
+
+class CustomTransformFirstHalfTask : public IRunnable {
+    const int* in_;
+    int* out_;
+    int half_elements_;
+public:
+    CustomTransformFirstHalfTask(const int* in, int* out, int half_elements)
+        : in_(in), out_(out), half_elements_(half_elements) {}
+    void runTask(int task_id, int num_total_tasks) {
+        int chunk = half_elements_ / num_total_tasks;
+        int start = task_id * chunk;
+        int end = (task_id == num_total_tasks - 1) ? half_elements_ : start + chunk;
+        for (int i = start; i < end; i++) {
+            out_[i] = in_[i] * 3;
+        }
+    }
+};
+
+class CustomTransformSecondHalfTask : public IRunnable {
+    const int* in_;
+    int* out_;
+    int start_offset_;
+    int half_elements_;
+public:
+    CustomTransformSecondHalfTask(const int* in, int* out, int start_offset, int half_elements)
+        : in_(in), out_(out), start_offset_(start_offset), half_elements_(half_elements) {}
+    void runTask(int task_id, int num_total_tasks) {
+        int chunk = half_elements_ / num_total_tasks;
+        int start = start_offset_ + task_id * chunk;
+        int end = (task_id == num_total_tasks - 1) ? (start_offset_ + half_elements_) : start + chunk;
+        for (int i = start; i < end; i++) {
+            out_[i] = in_[i] + 7;
+        }
+    }
+};
+
+class CustomFinalReductionTask : public IRunnable {
+    const int* in_;
+    int* out_;
+    int num_elements_;
+public:
+    CustomFinalReductionTask(const int* in, int* out, int num_elements)
+        : in_(in), out_(out), num_elements_(num_elements) {}
+    void runTask(int task_id, int num_total_tasks) {
+        int chunk = num_elements_ / num_total_tasks;
+        int start = task_id * chunk;
+        int end = (task_id == num_total_tasks - 1) ? num_elements_ : start + chunk;
+        for (int i = start; i < end; i++) {
+            out_[i] = in_[i] ^ 0x5A;
+        }
+    }
+};
+
+TestResults yourTest(ITaskSystem* t) {
+    const int num_elements = 1024 * 64;
+    const int half = num_elements / 2;
+    int* buf1 = new int[num_elements];
+    int* buf2 = new int[num_elements];
     int* output = new int[num_elements];
 
-    // TODO: instantiate your bulk task launches
+    CustomInitTask task_init(buf1, num_elements);
+    CustomTransformFirstHalfTask task_half1(buf1, buf2, half);
+    CustomTransformSecondHalfTask task_half2(buf1, buf2, half, half);
+    CustomFinalReductionTask task_final(buf2, output, num_elements);
 
-    // Run the test
     double start_time = CycleTimer::currentSeconds();
-    if (do_async) {
-        // TODO:
-        // initialize dependency vector
-        // make calls to t->runAsyncWithDeps and push TaskID to dependency vector
-        // t->sync() at end
-    } else {
-        // TODO: make calls to t->run
-    }
+
+    std::vector<TaskID> no_deps;
+    TaskID id_init = t->runAsyncWithDeps(&task_init, 32, no_deps);
+
+    std::vector<TaskID> branch_deps = {id_init};
+    TaskID id_branch1 = t->runAsyncWithDeps(&task_half1, 16, branch_deps);
+    TaskID id_branch2 = t->runAsyncWithDeps(&task_half2, 16, branch_deps);
+
+    std::vector<TaskID> join_deps = {id_branch1, id_branch2};
+    t->runAsyncWithDeps(&task_final, 32, join_deps);
+
+    t->sync();
+
     double end_time = CycleTimer::currentSeconds();
 
-    // Correctness validation
     TestResults results;
     results.passed = true;
-
-    for (int i=0; i<num_elements; i++) {
-        int value = 0; // TODO: initialize value
-        for (int j=0; j<num_bulk_task_launches; j++) {
-            // TODO: update value as expected
-        }
-
-        int expected = value;
+    for (int i = 0; i < half; i++) {
+        int expected = ((i + 1) * 3) ^ 0x5A;
         if (output[i] != expected) {
             results.passed = false;
-            printf("%d: %d expected=%d\n", i, output[i], expected);
+            printf("Error at index %d: got %d, expected %d\n", i, output[i], expected);
             break;
         }
     }
+    if (results.passed) {
+        for (int i = half; i < num_elements; i++) {
+            int expected = ((i + 1) + 7) ^ 0x5A;
+            if (output[i] != expected) {
+                results.passed = false;
+                printf("Error at index %d: got %d, expected %d\n", i, output[i], expected);
+                break;
+            }
+        }
+    }
+
     results.time = end_time - start_time;
 
-    delete [] output;
+    delete[] buf1;
+    delete[] buf2;
+    delete[] output;
 
     return results;
 }

@@ -228,39 +228,45 @@ void TaskSystemParallelThreadPoolSleeping::workerLoop() {
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Parts A and B.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
-    }
+    runAsyncWithDeps(runnable, num_total_tasks, {});
+    sync();
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                                     const std::vector<TaskID>& deps) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TaskID current_id = next_launch_id_++;
 
-
-    //
-    // TODO: CS149 students will implement this method in Part B.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    if (num_total_tasks <= 0) {
+        return current_id;
     }
 
-    return 0;
+    auto info = std::make_shared<TaskInfo>(current_id, runnable, num_total_tasks, 0);
+
+    // Deduplicate dependency IDs and identify any incomplete dependencies
+    std::set<TaskID> unique_deps(deps.begin(), deps.end());
+    for (TaskID dep : unique_deps) {
+        auto it = tasks_map_.find(dep);
+        if (it != tasks_map_.end()) {
+            it->second->dependents.push_back(current_id);
+            info->unresolved_deps++;
+        }
+    }
+
+    tasks_map_[current_id] = info;
+
+    // If all dependencies are satisfied, mark task as ready to execute
+    if (info->unresolved_deps == 0) {
+        ready_tasks_.push(current_id);
+        run_cv_.notify_all();
+    }
+
+    return current_id;
 }
 
 void TaskSystemParallelThreadPoolSleeping::sync() {
-
-    //
-    // TODO: CS149 students will modify the implementation of this method in Part B.
-    //
-
-    return;
+    std::unique_lock<std::mutex> lock(mutex_);
+    sync_cv_.wait(lock, [this]() {
+        return tasks_map_.empty();
+    });
 }

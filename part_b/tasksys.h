@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <set>
 #include "itasksys.h"
 
 /*
